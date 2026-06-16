@@ -1,58 +1,91 @@
+# src/fl_server.py
 from __future__ import annotations
-
-from typing import List, Tuple, Dict, Any
-import os
-from datetime import datetime
+from typing import Any, Dict, List, Tuple
 
 import flwr as fl
+import numpy as np
 
-from .config import TrainConfig, Paths
-from .utils_history import save_history_csv
+from .config import TrainConfig
+from .dp_utils import compute_epsilon_for_training
 from .strategy_scaffold import ScaffoldStrategy
 from .strategy_feddc import FedDCStrategy
+from .strategy_cdp import CentralDPStrategy
 
 
-def weighted_average_eval(metrics: List[Tuple[int, Dict[str, Any]]]) -> Dict[str, float]:
-    total = sum(n for n, _ in metrics)
-    total = max(1, total)
-    acc = sum(n * float(m.get("accuracy", 0.0)) for n, m in metrics) / total
-    f1 = sum(n * float(m.get("f1", 0.0)) for n, m in metrics) / total
-    return {"accuracy": float(acc), "f1": float(f1)}
+# ── Metric aggregation helpers ─────────────────────────────────────────────
+
+def weighted_average_eval(
+    metrics: List[Tuple[int, Dict[str, Any]]]
+) -> Dict[str, float]:
+    total = max(1, sum(n for n, _ in metrics))
+    return {
+        "accuracy": sum(n * float(m.get("accuracy", 0.0)) for n, m in metrics) / total,
+        "f1":       sum(n * float(m.get("f1",       0.0)) for n, m in metrics) / total,
+    }
 
 
-def weighted_average_fit(metrics: List[Tuple[int, Dict[str, Any]]]) -> Dict[str, Any]:
-    """
-    Aggregate only numeric fit metrics.
-    Ignore bytes like delta_c / gi (they stay in client metrics but won't break aggregation).
-    """
-    total = sum(n for n, _ in metrics)
-    total = max(1, total)
-
-    def wavg(key: str, default: float = 0.0) -> float:
-        return sum(n * float(m.get(key, default)) for n, m in metrics) / total
-
-    out: Dict[str, Any] = {}
-    numeric_keys = ["fit_wall_s", "fit_sim_s", "cpu_pct", "energy_wh"]
-    for k in numeric_keys:
-        if any(k in m for _, m in metrics):
-            out[k] = float(wavg(k, 0.0))
-
-    # keep labels (first found)
-    for label_key in ["device_key", "device_profile"]:
-        for _, m in metrics:
-            if label_key in m:
-                out[label_key] = m[label_key]
-                break
-
-    return out
+def weighted_average_fit(
+    metrics: List[Tuple[int, Dict[str, Any]]]
+) -> Dict[str, Any]:
+    if not metrics:
+        return {}
+    total_samples = max(1, sum(n for n, _ in metrics))
+    aggregated: Dict[str, float] = {}
+    for n, m in metrics:
+        weight = n / total_samples
+        for key, val in m.items():
+            if isinstance(val, (int, float)):
+                aggregated[key] = aggregated.get(key, 0.0) + val * weight
+    return aggregated
 
 
-def run_server(algo: str, rounds: int = 50, prox_mu: float = 0.01, dataset: str = "uci"):
+# ── Server entry point ─────────────────────────────────────────────────────
+
+def run_server(
+    algo: str,
+    rounds: int = 150,
+    prox_mu: float = 0.01,
+    dataset: str = "uci",
+    use_dp: bool = False,
+):
     cfg = TrainConfig()
-    paths = Paths()
+    cfg.use_dp = use_dp          # Sync CLI flag → config
 
-    algo = algo.lower().strip()
-    dataset = dataset.lower().strip()
+    # ── Pre-training privacy budget estimate ──────────────────────────────
+    if use_dp:
+        # Rough estimate: assumes each client has ~dataset_size/num_clients samples.
+        # Actual ε is tracked per-round via client metrics (dp_epsilon).
+        approx_dataset_per_client = 700   # conservative estimate for UCI HAR
+        est_eps = compute_epsilon_for_training(
+            num_rounds=rounds,
+            local_epochs=cfg.local_epochs,
+            batch_size=cfg.batch_size,
+            dataset_size=approx_dataset_per_client,
+            noise_multiplier=cfg.dp_noise_multiplier,
+            delta=cfg.dp_target_delta,
+        )
+        print(
+            f"\n[DP-Prox] DP-SGD configuration"
+            f"\n  Algo              : {algo}"
+            f"\n  clip_norm  (C)    : {cfg.dp_clip_norm}"
+            f"\n  noise_mult (σ)    : {cfg.dp_noise_multiplier}"
+            f"\n  target ε          : {cfg.dp_target_epsilon}"
+            f"\n  target δ          : {cfg.dp_target_delta}"
+            f"\n  prox_mu    (μ)    : {prox_mu}"
+            f"\n  rounds            : {rounds}"
+            f"\n  local_epochs      : {cfg.local_epochs}"
+            f"\n  batch_size        : {cfg.batch_size}"
+            f"\n  Estimated total ε : {est_eps:.2f}  "
+            f"(target ≤ {cfg.dp_target_epsilon})\n"
+        )
+        if est_eps > cfg.dp_target_epsilon * 1.5:
+            print(
+                f"  ⚠  Estimated ε ({est_eps:.2f}) exceeds target "
+                f"({cfg.dp_target_epsilon}).  "
+                f"Consider increasing noise_multiplier or reducing rounds.\n"
+            )
+    else:
+        print(f"\n[SERVER] Algo={algo} | DP=OFF | Rounds={rounds}\n")
 
     common_kwargs = dict(
         fraction_fit=1.0,
@@ -61,27 +94,25 @@ def run_server(algo: str, rounds: int = 50, prox_mu: float = 0.01, dataset: str 
         min_evaluate_clients=int(cfg.num_clients),
         min_available_clients=int(cfg.num_clients),
         evaluate_metrics_aggregation_fn=weighted_average_eval,
-        fit_metrics_aggregation_fn=weighted_average_fit,   # ✅ crucial
+        fit_metrics_aggregation_fn=weighted_average_fit,
     )
 
-    if algo == "fedavg":
-        strategy = fl.server.strategy.FedAvg(
+    if algo.lower() in ["fedavg", "fedprox"]:
+        strategy = CentralDPStrategy(
+            cfg=cfg,
             **common_kwargs,
-            on_fit_config_fn=lambda r: {"algo": "fedavg"},
+            on_fit_config_fn=lambda r: {
+                "algo": algo,
+                "prox_mu": float(prox_mu),
+            },
         )
-
-    elif algo == "fedprox":
-        strategy = fl.server.strategy.FedAvg(
+    elif algo.lower() == "scaffold":
+        strategy = ScaffoldStrategy(cfg=cfg, **common_kwargs)
+    elif algo.lower() == "feddc":
+        strategy = FedDCStrategy(
+            penalty_alpha=float(cfg.feddc_penalty_alpha),
             **common_kwargs,
-            on_fit_config_fn=lambda r: {"algo": "fedprox", "prox_mu": float(prox_mu)},
         )
-
-    elif algo == "scaffold":
-        strategy = ScaffoldStrategy(**common_kwargs)
-
-    elif algo == "feddc":
-        strategy = FedDCStrategy(penalty_alpha=float(cfg.feddc_penalty_alpha), **common_kwargs)
-
     else:
         raise ValueError(f"Unknown algo: {algo}")
 
@@ -91,33 +122,19 @@ def run_server(algo: str, rounds: int = 50, prox_mu: float = 0.01, dataset: str 
         strategy=strategy,
     )
 
-    if history is None:
-        print("[CSV] No history returned (server may have stopped early).")
-        return
+    # 保存最终全局模型
+    import torch
+    from .models import CNN1DClassifier
+    from collections import OrderedDict
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"{dataset}_{algo}_r{int(rounds)}_{ts}"
-    out_path = os.path.join(paths.out_dir, f"{run_name}.csv")
+    final_ndarrays = fl.common.parameters_to_ndarrays(strategy._last_params)
+    model = CNN1DClassifier(input_dim=9, num_classes=6)
+    keys = list(model.state_dict().keys())
+    state_dict = OrderedDict(
+        {k: torch.tensor(v) for k, v in zip(keys, final_ndarrays)}
+    )
+    model.load_state_dict(state_dict)
+    torch.save(model.state_dict(), "pretrained_9ch.pth")
+    print("\n✅ 预训练模型已保存：pretrained_9ch.pth")
 
-    print("=== HISTORY ATTRS CHECK ===")
-    for name in [
-        "losses_distributed",
-        "metrics_distributed",
-        "metrics_distributed_fit",
-        "metrics_fit_distributed",
-        "metrics_centralized",
-        "metrics_fit",
-    ]:
-        v = getattr(history, name, None)
-        if v is None:
-            print(name, "-> None")
-        else:
-            try:
-                print(name, "->", type(v), "len=", len(v))
-                if len(v) > 0:
-                    print("  first item:", v[0])
-            except Exception as e:
-                print(name, "->", type(v), "cannot len()", e)
-        
-        save_history_csv(history, out_path)
-        print(f"[CSV] History saved to: {out_path}")
+    return history

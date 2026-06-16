@@ -1,22 +1,24 @@
 # Python
 __pycache__/
 *.pyc
-*.pyo
-
-# Virtual environment
 .venv/
 venv/
 
-# Data & results (DO NOT upload)
+# Data & results (太大或敏感,按需调整)
 data/
-results/
-models/
+*.csv
+*.npz
+*.npy
 
-# Jupyter
-.ipynb_checkpoints/
-
-# OS files
-.DS_Store
+# Model checkpoints
+*.pth
+*.pt
+*.ckpt
+models/*.pth
 
 # Logs
+logs/
 *.log
+
+# OS
+.DS_Store

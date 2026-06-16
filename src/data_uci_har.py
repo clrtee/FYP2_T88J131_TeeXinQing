@@ -52,4 +52,4 @@ def load_uci_har(uci_root: str):
 
     Xtr = X_all[: len(Xtr)]
     Xte = X_all[len(Xtr):]
-    return (Xtr, ytr), (Xte, yte)
+    return (Xtr, ytr), (Xte, yte), scaler
